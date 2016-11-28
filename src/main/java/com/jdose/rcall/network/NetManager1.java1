@@ -1,0 +1,399 @@
+/*
+ * To change this license header, choose License Headers in Project Properties.
+ * To change this template file, choose Tools | Templates
+ * and open the template in the editor.
+ */
+package com.subex.smi.commons.network;
+
+import com.subex.smi.Machine;
+import com.subex.smi.commons.Initialisable;
+import com.subex.smi.commons.exception.SDSRuntimeException;
+import com.subex.smi.commons.exception.InitialisationException;
+import com.subex.smi.commons.exception.NetManagerException;
+import com.subex.smi.commons.frame.SerializableFrame;
+
+import java.io.IOException;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.locks.ReentrantLock;
+
+/**
+ *
+ * @author abhishek.i
+ */
+public class NetManager1 implements NetworkResponseListener
+{
+
+    private NetManager(){};
+    private static boolean isInitialised = false;
+    private static NetManager netManager;
+    private static ObjectSenderProvider objectSenderProvider = new ObjectSenderProvider();
+    private static Set<TimedResponse> pendingResponseSet = new HashSet<TimedResponse>();
+    private static PendingListTimedResponseManager pendingTimedResponseManager = new PendingListTimedResponseManager();
+
+
+    public static NetManager getManager()
+    {
+        if( isInitialised )
+        {
+            return netManager;
+        }
+
+        throw new SDSRuntimeException( "Net manager is not initialised." );
+    }
+
+
+    public static void initialise() throws InitialisationException
+    {
+        if( isInitialised )
+        {
+            throw new InitialisationException( "Has already initialised." );
+        }
+
+        if (netManager == null )
+        {
+            netManager = new NetManager();
+            netManager.initialise();
+        }
+        objectSenderProvider.initialise();
+        objectSenderProvider.registerNetworkResponseListener( netManager );
+
+        pendingTimedResponseManager.initialise();
+        isInitialised = true;
+    }
+
+    public static void sendObject( Machine machine, SerializableFrame serializableFrame, final TransmissionStatusListener transmissionStatusListener) throws NetManagerException
+    {
+        try
+        {
+            objectSenderProvider.get( machine ).sendObject( serializableFrame );
+            long ackTimeOut=-1;
+            pendingTimedResponseManager.addToPendingListTimedResponseList( new DefaultNetworkResponseListener(serializableFrame.getFrameUUID().toString(), ackTimeOut, new ResponseCallBack<NetworkResponse>() {
+
+                @Override
+                public void onResponse( NetworkResponse networkResponse )
+                {
+                    transmissionStatusListener.onSuccess( networkResponse );
+                }
+
+                @Override
+                public void onTimeOut()
+                {
+                    transmissionStatusListener.onFailure( new NetManagerException("Response/Acknowledgement timed out ") );
+                }
+            }));
+
+
+
+        }
+        catch ( IOException e )
+        {
+            throw new NetManagerException( e );
+        }
+    }
+
+    public void onArrivalOfNetworkResponse( NetworkResponse networkResponse )
+    {
+        pendingTimedResponseManager.onResponseArrival( networkResponse );
+    }
+}
+
+    public static void sendObject( Machine machine, SerializableFrame serializableFrame ) throws NetManagerException
+    {
+        try
+        {
+            objectSenderProvider.get( machine ).sendObject( serializableFrame );
+            long ackTimeOut=-1;
+            pendingTimedResponseManager.addToPendingListTimedResponseList( new DefaultNetworkResponseListener(serializableFrame.getFrameUUID().toString(), ackTimeOut, new ResponseCallBack<NetworkResponse>() {
+
+                @Override
+                public void onResponse( NetworkResponse networkResponse )
+                {
+                    transmissionStatusListener.onSuccess( networkResponse );
+                }
+
+                @Override
+                public void onTimeOut()
+                {
+                    transmissionStatusListener.onFailure( new NetManagerException("Response/Acknowledgement timed out ") );
+                }
+            }));
+
+
+
+        }
+        catch ( IOException e )
+        {
+            throw new NetManagerException( e );
+        }
+    }
+
+class PendingListTimedResponseManager implements Initialisable
+{
+    private Map< String , DefaultNetworkResponseListener > pendingResponses = new ConcurrentHashMap< String, DefaultNetworkResponseListener >();
+    private Queue< NetworkResponse > networkResponseQueue = new ConcurrentLinkedQueue<NetworkResponse>();
+    private ReentrantLock pendingListLock = new ReentrantLock();
+
+    private boolean iterationLock;
+
+    public void addToPendingListTimedResponseList( DefaultNetworkResponseListener defaultNetworkResponseListener )
+    {
+        pendingResponses.put( defaultNetworkResponseListener.getListeningUUID(), defaultNetworkResponseListener );
+    }
+
+    public void onResponseArrival ( NetworkResponse networkResponse )
+    {
+        networkResponseQueue.add( networkResponse );
+
+        synchronized ( networkResponseQueue )
+        {
+            networkResponse.notify();
+        }
+    }
+
+    @Override
+    public void initialise() throws InitialisationException
+    {
+        new ResponseArrivalHandlerThread().start();
+        new NetworkResponseTimeOutChecker().start();
+    }
+
+    private class ResponseArrivalHandlerThread extends Thread
+    {
+        public ResponseArrivalHandlerThread()
+        {
+            super("ResponseArrivalHandler Thread");
+        }
+
+        @Override
+        public void run()
+        {
+            while ( true )
+            {
+                pendingListLock.lock();
+
+                while (!networkResponseQueue.isEmpty())
+                {
+                    NetworkResponse networkResponse = networkResponseQueue.poll();
+                    pendingResponses.remove( networkResponse.getFrameUUID() ).onResponseArrival(networkResponse);
+                }
+
+                pendingListLock.unlock();
+
+                while ( networkResponseQueue.isEmpty() )
+                {
+                    synchronized ( networkResponseQueue )
+                    {
+                        try
+                        {
+                            networkResponseQueue.wait();
+                        }
+                        catch (InterruptedException e)
+                        {
+                            e.printStackTrace();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private class NetworkResponseTimeOutChecker extends Thread
+    {
+        public NetworkResponseTimeOutChecker()
+        {
+            super( "NetworkResponseTimeOutChecker Thread" );
+        }
+
+        @Override
+        public void run()
+        {
+            long scheduledDateTime = System.currentTimeMillis();
+
+            while ( true )
+            {
+                Iterator <DefaultNetworkResponseListener>  iterator = getIterator();
+
+                pendingListLock.lock();
+
+                while ( iterator.hasNext() )
+                {
+                    if ( iterator.next().hasTimedOut( scheduledDateTime ) )
+                    {
+                        iterator.remove();
+                    }
+                }
+
+                pendingListLock.unlock();
+
+                try
+                {
+                    Thread.sleep( 1000 );
+                }
+                catch (InterruptedException e)
+                {
+                    e.printStackTrace();
+                }
+            }
+        }
+    }
+
+
+    public ResponseIterator getIterator()
+    {
+        iterationLock = true;
+
+        return new ResponseIterator();
+    }
+
+
+    private class ResponseIterator implements Iterator<DefaultNetworkResponseListener>
+    {
+        private Iterator<Map.Entry< String,DefaultNetworkResponseListener >> iterator;
+
+        public ResponseIterator()
+        {
+            iterator = pendingResponses.entrySet().iterator();
+        }
+
+        @Override
+        public boolean hasNext()
+        {
+            if( ! iterator.hasNext() )
+            {
+                return false;
+            }
+            return true;
+        }
+
+        @Override
+        public DefaultNetworkResponseListener next()
+        {
+            return iterator.next().getValue();
+        }
+
+        @Override
+        public void remove()
+        {
+            iterator.remove();
+        }
+    }
+}
+
+
+class DefaultNetworkResponseListener extends AbstractNetworkResponseListener
+{
+    public DefaultNetworkResponseListener( String frameUUID, long timeOut, ResponseCallBack responseCallBack)
+    {
+        super(frameUUID, timeOut, responseCallBack);
+    }
+
+    @Override
+    protected void onTimeOut()
+    {
+        responseCallBack.onTimeOut();
+    }
+
+    @Override
+    protected void onResponseArrival( NetworkResponse networkResponse )
+    {
+        responseCallBack.onResponse(networkResponse);
+    }
+}
+
+abstract class AbstractNetworkResponseListener implements TimedResponse, TimedResponseVisitable
+{
+    private String frameUUID;
+    private long txDateTime;
+    private long timeOut;
+    protected ResponseCallBack responseCallBack;
+
+
+    public AbstractNetworkResponseListener( String frameUUID, long timeOut, ResponseCallBack responseCallBack )
+    {
+        this.frameUUID = frameUUID;
+        this.timeOut = timeOut;
+        this.responseCallBack = responseCallBack;
+        txDateTime = System.currentTimeMillis();
+    }
+
+    @Override
+    public boolean hasTimedOut( long fromTime )
+    {
+        if ( ( txDateTime - fromTime ) > timeOut)
+        {
+            try
+            {
+                onTimeOut();
+            }
+            catch (Throwable t)
+            {
+
+            }
+            finally
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    @Override
+    public String getListeningUUID()
+    {
+        return frameUUID;
+    }
+
+    @Override
+    public void accept(TimedResponseVisitor timedResponseVisitor)
+    {
+        timedResponseVisitor.visit( this );
+    }
+
+    protected abstract void onTimeOut();
+
+    protected abstract void onResponseArrival( NetworkResponse networkResponse  );
+}
+//----------------------------------------------------------------------------------------
+interface TimedResponseVisitor
+{
+    /**
+     *
+     * @param timedResponse
+     * @return true if the visited entity has time out.
+     */
+    public boolean visit ( TimedResponse timedResponse );
+}
+
+interface TimedResponseVisitable
+{
+    public void accept ( TimedResponseVisitor timedResponseVisitor );
+}
+
+class NetworkResponseVisitor implements TimedResponseVisitor
+{
+    private long scheduledDateTime;
+
+    @Override
+    public boolean visit( TimedResponse timedResponse )
+    {
+        if ( timedResponse.hasTimedOut( scheduledDateTime ) )
+        {
+            return true;
+        }
+        return false;
+    }
+}
+//---------------------------------------------------------------------------------------------
+interface TimedResponse
+{
+    /**
+     *
+     * @param fromTime This is not current time, this is the time when the TimeOutChecker was scheduled.
+     * @return true if timed-out false if not
+     */
+    public boolean hasTimedOut( long fromTime );
+
+    public String getListeningUUID();
+}
